@@ -45,6 +45,7 @@
 <div class="hud tl">
   <div class="title">NULLWAVE 02</div>
   <div class="dim" style="margin-top:6px">MEDIAPIPE / HANDS / FREEZE COLLAGE</div>
+  <div class="dim" style="margin-top:4px">by <a href="https://www.instagram.com/lisysbs" target="_blank" rel="noopener" style="color:inherit">@lisysbs</a> — tag me if you post</div>
 </div>
 
 <div class="hud tr">
@@ -951,7 +952,15 @@ function frame(now){
   else if(mode===1)renderDetect(now);
   else renderHands(now);
   applyPost();
-  if(recorder)rctx.drawImage(out,0,0,recCanvas.width,recCanvas.height);
+  if(recorder){
+    rctx.drawImage(out,0,0,recCanvas.width,recCanvas.height);
+    // baked-in credit on recordings only (live view stays clean)
+    const fs=Math.round(recCanvas.height*0.024);
+    rctx.font=`${fs}px ui-monospace,Menlo,monospace`;
+    rctx.textAlign="right";
+    rctx.fillStyle="rgba(255,255,255,0.55)";
+    rctx.fillText("@lisysbs",recCanvas.width-fs,recCanvas.height-fs);
+  }
   frames++;
   if(now-lastFps>1000){
     statsEl.textContent=`${frames} FPS`;

@@ -35,3 +35,7 @@ quadtree mosaic / mondrian / cyanotype print / rutt-etra scanlines / datamosh / 
 ## Privacy
 
 All processing happens locally in your browser. Camera and mic data never leave your device.
+
+## Credit
+
+Free to play with. If you post something made with NULLWAVE, tagging [@lisysbs](https://www.instagram.com/lisysbs) would make my day.
