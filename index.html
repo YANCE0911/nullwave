@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NULLWAVE — hand-controlled visuals</title>
+<style>
+  :root{
+    --bg:#000000;
+    --fg:#8b9299;
+    --fg-dim:#4a5157;
+    --accent:#00ffc8;
+    --hud-font:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);overflow:hidden}
+  canvas#out{position:fixed;inset:0;width:100%;height:100%;display:block}
+  video{display:none}
+  .hud{
+    position:fixed;z-index:2;font-family:var(--hud-font);font-size:11px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--fg);
+    user-select:none;-webkit-user-select:none;
+  }
+  .hud.tl{top:18px;left:20px}
+  .hud.tr{top:18px;right:20px;text-align:right}
+  .hud.bl{bottom:18px;left:20px}
+  .hud.br{bottom:18px;right:20px;text-align:right}
+  .hud .title{color:#d7dde2;letter-spacing:.3em;font-size:12px}
+  .hud .dim{color:var(--fg-dim)}
+  .hud .row{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .hud.tr .row{justify-content:flex-end}
+  button.chip{
+    font:inherit;letter-spacing:inherit;text-transform:inherit;
+    background:transparent;color:var(--fg);border:1px solid #2a2f33;
+    padding:5px 10px;cursor:pointer;border-radius:2px;
+  }
+  button.chip:hover{color:#d7dde2;border-color:#4a5157}
+  button.chip:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+  button.chip.on{color:var(--accent);border-color:var(--accent)}
+</style>
+</head>
+<body>
+<canvas id="out"></canvas>
+<video id="cam" playsinline muted></video>
+
+<div class="hud tl">
+  <div class="title">NULLWAVE 02</div>
+  <div class="dim" style="margin-top:6px">MEDIAPIPE / HANDS / FREEZE COLLAGE</div>
+</div>
+
+<div class="hud tr">
+  <div class="row">
+    <button class="chip" id="mic">Mic input</button>
+    <button class="chip" id="rec">Rec</button>
+  </div>
+  <div class="dim row" style="justify-content:flex-end" id="status">Loading model...</div>
+</div>
+
+<div class="hud bl dim" id="stats"></div>
+<div class="hud br dim">M mic / R rec / Pinch to freeze / X clear</div>
+
+<script type="module">
+import { FilesetResolver, ImageSegmenter, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const statusEl=document.getElementById("status");
+const statsEl=document.getElementById("stats");
+const out=document.getElementById("out");
+const ctx=out.getContext("2d");
+const video=document.getElementById("cam");
+
+let CW=0,CH=0,DPR=1;
+function resize(){
+  DPR=Math.min(devicePixelRatio||1,2);
+  CW=Math.floor(innerWidth*DPR); CH=Math.floor(innerHeight*DPR);
+  out.width=CW; out.height=CH;
+}
+addEventListener("resize",resize); resize();
+
+/* ---------- camera ---------- */
+let vw=640, vh=360, camOn=false;
+try{
+  const stream=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720,facingMode:"user"}});
+  video.srcObject=stream; await video.play();
+  vw=video.videoWidth; vh=video.videoHeight; camOn=true;
+}catch(e){
+  statusEl.textContent="Camera blocked - allow and reload";
+}
+
+/* ---------- mediapipe ---------- */
+let segmenter=null, hands=null, visionFileset=null;
+async function loadSegmenter(){
+  visionFileset ??= await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  segmenter = await ImageSegmenter.createFromOptions(visionFileset,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+      delegate:"GPU"
+    },
+    runningMode:"VIDEO",
+    outputCategoryMask:false,
+    outputConfidenceMasks:true
+  });
+}
+async function loadHands(){
+  if(hands) return;
+  statusEl.textContent="Loading hand model...";
+  visionFileset ??= await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  hands = await HandLandmarker.createFromOptions(visionFileset,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+      delegate:"GPU"
+    },
+    runningMode:"VIDEO",
+    numHands:2
+  });
+  statusEl.textContent="Ready";
+}
+if(camOn){ await loadHands(); }
+
+/* ---------- offscreen buffers ---------- */
+const person=document.createElement("canvas"); person.width=vw; person.height=vh;
+const pctx=person.getContext("2d");
+const maskCan=document.createElement("canvas");
+const mctx=maskCan.getContext("2d");
+const small=document.createElement("canvas");
+const sctx=small.getContext("2d",{willReadFrequently:true});
+const mosaic=document.createElement("canvas");
+const moctx=mosaic.getContext("2d");
+
+/* ---------- audio (mic or simulated) ---------- */
+let analyser=null,freq=null,micOn=false,micStream=null,level=0,beat=0,prevRaw=0;
+const micBtn=document.getElementById("mic");
+micBtn.addEventListener("click",async()=>{
+  if(micOn){micOn=false;analyser=null;micBtn.classList.remove("on");return;}
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:true});
+    micStream=s;
+    const ac=new AudioContext();
+    analyser=ac.createAnalyser();analyser.fftSize=512;analyser.smoothingTimeConstant=0.7;
+    ac.createMediaStreamSource(s).connect(analyser);
+    freq=new Uint8Array(analyser.frequencyBinCount);
+    micOn=true;micBtn.classList.add("on");
+  }catch(e){statusEl.textContent="Mic blocked";}
+});
+function updateAudio(t){
+  let raw;
+  if(micOn&&analyser){
+    analyser.getByteFrequencyData(freq);
+    let s=0;for(let i=2;i<24;i++)s+=freq[i];
+    raw=Math.min(1,s/(22*255)*1.6);
+  }else{
+    const bps=116/60;
+    raw=Math.min(1,Math.pow(Math.max(0,1-(t*bps%1)*2.2),3)*0.6+0.15);
+  }
+  level+=(raw-level)*0.25;
+  if(raw-prevRaw>0.25&&beat<0.25)beat=1;
+  prevRaw=raw;beat*=0.9;
+}
+
+/* ---------- eq bands / film post ---------- */
+const BAYER=[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+const EQ_N=36, eqVals=new Float32Array(EQ_N), eqPeaks=new Float32Array(EQ_N);
+function updateEQ(t){
+  for(let i=0;i<EQ_N;i++){
+    let v;
+    if(micOn&&freq){
+      const lo=2+Math.floor(Math.pow(i/EQ_N,1.6)*110);
+      const hi=Math.max(lo+1,2+Math.floor(Math.pow((i+1)/EQ_N,1.6)*110));
+      let s=0;for(let j=lo;j<hi&&j<freq.length;j++)s+=freq[j];
+      v=Math.min(1,s/(hi-lo)/255*1.5);
+    }else{
+      v=Math.max(0,(0.3+0.7*Math.abs(Math.sin(i*0.7+t*0.004)))*(0.25+level)-i/EQ_N*0.12);
+    }
+    eqVals[i]+=(v-eqVals[i])*0.45;
+    eqPeaks[i]=Math.max(eqPeaks[i]-0.012,eqVals[i]);
+  }
+}
+const grain=document.createElement("canvas");
+grain.width=256;grain.height=256;
+{
+  const g=grain.getContext("2d");
+  const id=g.createImageData(256,256);
+  for(let i=0;i<id.data.length;i+=4){
+    const v=128+(Math.random()-0.5)*255;
+    id.data[i]=id.data[i+1]=id.data[i+2]=v;id.data[i+3]=255;
+  }
+  g.putImageData(id,0,0);
+}
+let vig=null;
+function applyPost(){
+  ctx.save();
+  ctx.globalCompositeOperation="overlay";
+  ctx.globalAlpha=0.07;
+  const gx=(Math.random()*256)|0, gy=(Math.random()*256)|0;
+  for(let y=-gy;y<CH;y+=256)for(let x=-gx;x<CW;x+=256)ctx.drawImage(grain,x,y);
+  ctx.restore();
+  if(!vig||vig.width!==CW||vig.height!==CH){
+    vig=document.createElement("canvas");vig.width=CW;vig.height=CH;
+    const g=vig.getContext("2d");
+    const rg=g.createRadialGradient(CW/2,CH/2,Math.min(CW,CH)*0.42,CW/2,CH/2,Math.hypot(CW,CH)*0.55);
+    rg.addColorStop(0,"rgba(0,0,0,0)");
+    rg.addColorStop(1,"rgba(0,0,0,0.45)");
+    g.fillStyle=rg;g.fillRect(0,0,CW,CH);
+  }
+  ctx.drawImage(vig,0,0);
+}
+
+/* ---------- mode / interaction ---------- */
+const mode=2;
+addEventListener("keydown",e=>{
+  if(e.key==="m"||e.key==="M")micBtn.click();
+  else if(e.key==="x"||e.key==="X")stamps.length=0;
+  else if(e.key==="r"||e.key==="R")recBtn.click();
+});
+
+/* ---------- recording (canvas -> webm) ---------- */
+const recBtn=document.getElementById("rec");
+const recCanvas=document.createElement("canvas");
+const rctx=recCanvas.getContext("2d");
+let recorder=null, recChunks=[], recTimer=null, recStart=0;
+recBtn.addEventListener("click",()=>{
+  if(recorder){ recorder.stop(); return; }
+  // record via a 1080p-class intermediate canvas: fewer pixels + more bitrate = far better quality
+  const scale=Math.min(1,1920/Math.max(CW,CH));
+  recCanvas.width=Math.round(CW*scale/2)*2;
+  recCanvas.height=Math.round(CH*scale/2)*2;
+  const stream=recCanvas.captureStream(60);
+  const mime=["video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm","video/mp4"]
+    .find(m=>MediaRecorder.isTypeSupported(m))||"";
+  recChunks=[];
+  recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:40_000_000});
+  recorder.ondataavailable=e=>{if(e.data.size)recChunks.push(e.data);};
+  recorder.onstop=()=>{
+    clearInterval(recTimer);
+    recBtn.classList.remove("on");recBtn.textContent="Rec";
+    const ext=mime.includes("mp4")?"mp4":"webm";
+    const blob=new Blob(recChunks,{type:mime||"video/webm"});
+    const d=new Date(), p=n=>String(n).padStart(2,"0");
+    const name=`nullwave_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);a.download=name;a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    recorder=null;
+  };
+  recorder.start(250);
+  recStart=Date.now();
+  recBtn.classList.add("on");
+  recTimer=setInterval(()=>{
+    const s=((Date.now()-recStart)/1000)|0;
+    recBtn.textContent=`Rec ${(s/60)|0}:${String(s%60).padStart(2,"0")}`;
+  },500);
+});
+
+/* ---------- segmentation state ---------- */
+const GW=192, GH=Math.round(192*vh/vw); // analysis grid
+let conf=new Float32Array(GW*GH);      // person confidence, this frame
+let prevConf=new Float32Array(GW*GH);
+let invert=false, lastCalib=0;
+let bbox=null;
+
+function runSegmentation(ts){
+  if(!segmenter) return;
+  const res=segmenter.segmentForVideo(video,ts);
+  const m=res.confidenceMasks&&res.confidenceMasks[0];
+  if(!m) return;
+  const mw=m.width, mh=m.height;
+  const arr=m.getAsFloat32Array();
+  // downsample to grid
+  [prevConf,conf]=[conf,prevConf];
+  for(let gy=0;gy<GH;gy++){
+    const sy=Math.floor(gy/GH*mh);
+    for(let gx=0;gx<GW;gx++){
+      const sx=Math.floor(gx/GW*mw);
+      let v=arr[sy*mw+sx];
+      conf[gy*GW+gx]=invert?1-v:v;
+    }
+  }
+  // auto-calibrate polarity once per second: person should be denser in center than at frame edge
+  if(ts-lastCalib>1000){
+    lastCalib=ts;
+    let c=0,cn=0,e=0,en=0;
+    for(let gy=0;gy<GH;gy++)for(let gx=0;gx<GW;gx++){
+      const v=conf[gy*GW+gx];
+      const cx=Math.abs(gx/GW-0.5), cy=Math.abs(gy/GH-0.5);
+      if(cx<0.15&&cy<0.2){c+=v;cn++;}
+      else if(cx>0.42||cy>0.44){e+=v;en++;}
+    }
+    if(cn&&en&&e/en>c/cn+0.15) invert=!invert;
+  }
+  // alpha mask canvas at mask resolution
+  if(maskCan.width!==mw){maskCan.width=mw;maskCan.height=mh;}
+  const id=mctx.createImageData(mw,mh);
+  const d=id.data;
+  for(let i=0;i<mw*mh;i++){
+    let v=arr[i]; if(invert)v=1-v;
+    d[i*4+3]=Math.max(0,Math.min(255,(v-0.25)*255/0.5));
+  }
+  mctx.putImageData(id,0,0);
+  // person cutout
+  pctx.clearRect(0,0,vw,vh);
+  pctx.drawImage(video,0,0,vw,vh);
+  pctx.globalCompositeOperation="destination-in";
+  pctx.filter="blur(1.5px)"; // soften the segmentation edge
+  pctx.drawImage(maskCan,0,0,vw,vh);
+  pctx.filter="none";
+  pctx.globalCompositeOperation="source-over";
+  // bbox from grid
+  let x0=GW,x1=0,y0=GH,y1=0,n=0;
+  for(let gy=0;gy<GH;gy++)for(let gx=0;gx<GW;gx++){
+    if(conf[gy*GW+gx]>0.5){n++;
+      if(gx<x0)x0=gx; if(gx>x1)x1=gx; if(gy<y0)y0=gy; if(gy>y1)y1=gy;}
+  }
+  bbox = n>40 ? {x0:x0/GW,x1:(x1+1)/GW,y0:y0/GH,y1:(y1+1)/GH} : null;
+  for(const mm of res.confidenceMasks) mm.close();
+}
+
+/* ---------- dissolve particles (spawned where the mask moved) ---------- */
+const parts=[];
+function spawnParticles(){
+  if(!bbox) return;
+  sctx.canvas.width=GW; sctx.canvas.height=GH;
+  sctx.drawImage(video,0,0,GW,GH);
+  const vid=sctx.getImageData(0,0,GW,GH).data;
+  const strength=0.35+level*0.6;
+  for(let i=0;i<900;i++){
+    const gx=(Math.random()*GW)|0, gy=(Math.random()*GH)|0;
+    const k=gy*GW+gx;
+    const diff=Math.abs(conf[k]-prevConf[k]);
+    if(diff>0.35&&Math.random()<strength){
+      const j=k*4;
+      parts.push({
+        x:gx/GW, y:gy/GH,
+        vx:(Math.random()-0.5)*0.004,
+        vy:-0.002-Math.random()*0.006,
+        r:vid[j],g:vid[j+1],b:vid[j+2],
+        life:1
+      });
+    }
+  }
+  if(parts.length>5000) parts.splice(0,parts.length-5000);
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i];
+    p.x+=p.vx; p.y+=p.vy; p.vy-=0.00005; p.life-=0.012+level*0.01;
+    if(p.life<=0) parts.splice(i,1);
+  }
+}
+
+/* ---------- helpers ---------- */
+// person is drawn "contain"-fit; returns transform video->screen
+function fitRect(){
+  const s=Math.min(CW/vw,CH/vh)*0.92;
+  return {s, ox:(CW-vw*s)/2, oy:(CH-vh*s)/2+CH*0.02};
+}
+function glitchLabel(len){
+  const chars="R▸PR↑G◂E$#/=%O†S";
+  let s="";
+  for(let i=0;i<len;i++)s+=chars[(Math.random()*chars.length)|0];
+  return s;
+}
+let labelText=glitchLabel(6), labelT=0;
+
+/* ---------- mode renderers ---------- */
+function drawFloor(f){
+  if(!bbox) return;
+  // lit floor tile under the feet, like a stage spotlight
+  const cx=f.ox+(1-(bbox.x0+bbox.x1)/2)*vw*f.s; // mirrored center
+  const w=(bbox.x1-bbox.x0)*vw*f.s;
+  const fy=f.oy+bbox.y1*vh*f.s;
+  const g=ctx.createRadialGradient(cx,fy,0,cx,fy,w*1.3);
+  g.addColorStop(0,"rgba(255,250,240,0.55)");
+  g.addColorStop(0.5,"rgba(255,245,230,0.12)");
+  g.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle=g;
+  ctx.beginPath();ctx.ellipse(cx,fy,w*1.4,w*0.35,0,0,7);ctx.fill();
+  ctx.fillStyle="rgba(245,242,235,0.85)";
+  ctx.shadowColor="rgba(255,250,240,0.9)";ctx.shadowBlur=30*DPR;
+  ctx.fillRect(cx-w*0.65,fy-4*DPR,w*1.3,10*DPR);
+  ctx.shadowBlur=0;
+}
+function drawPersonMirrored(f,alpha=1){
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  ctx.translate(f.ox+vw*f.s,f.oy); ctx.scale(-f.s,f.s);
+  ctx.drawImage(person,0,0,vw,vh);
+  ctx.restore();
+  ctx.globalAlpha=1;
+}
+function drawParticles(f){
+  ctx.save();
+  ctx.globalCompositeOperation="lighter";
+  for(const p of parts){
+    const x=f.ox+(1-p.x)*vw*f.s, y=f.oy+p.y*vh*f.s;
+    ctx.fillStyle=`rgba(${p.r},${p.g},${p.b},${p.life.toFixed(2)})`;
+    const sz=(1+p.life*1.6)*DPR;
+    ctx.fillRect(x,y,sz,sz);
+  }
+  ctx.restore();
+}
+
+function renderCutout(){
+  const f=fitRect();
+  drawFloor(f);
+  drawPersonMirrored(f);
+  drawParticles(f);
+}
+
+const STYLES=["green","blue","red","natural"];
+let styleIdx=0,styleT=0;
+function renderDetect(t){
+  const f=fitRect();
+  if(t-styleT>3500){styleT=t;styleIdx=(styleIdx+1)%STYLES.length;labelText=glitchLabel(6);}
+  const style=STYLES[styleIdx];
+  drawFloor(f);
+  if(style==="natural"){
+    drawPersonMirrored(f);
+  }else{
+    // matrix mosaic inside the mask
+    sctx.canvas.width=GW;sctx.canvas.height=GH;
+    sctx.drawImage(video,0,0,GW,GH);
+    const vid=sctx.getImageData(0,0,GW,GH).data;
+    mosaic.width=GW;mosaic.height=GH;
+    const id=moctx.createImageData(GW,GH);
+    const d=id.data;
+    for(let k=0;k<GW*GH;k++){
+      if(conf[k]<=0.5)continue;
+      const j=k*4;
+      let lum=(vid[j]*0.299+vid[j+1]*0.587+vid[j+2]*0.114)/255;
+      lum=Math.pow(lum,0.8);
+      // dither grid: drop pixels in a checker pattern for the LED-matrix texture
+      const gx=k%GW, gy=(k/GW)|0;
+      if((gx+gy)%2===1&&lum<0.75)lum*=0.25;
+      let r,g,b;
+      if(style==="green"){r=20*lum;g=90+165*lum;b=40*lum;}
+      else if(style==="red"){r=90+165*lum;g=25*lum;b=30*lum;}
+      else{ // blue solarized: bright ice blue, dark areas glow
+        const iv=1-lum*0.55;
+        r=110*iv;g=170*iv+40;b=255*Math.min(1,iv+0.25);
+      }
+      d[j]=r;d[j+1]=g;d[j+2]=b;d[j+3]=255;
+    }
+    moctx.putImageData(id,0,0);
+    ctx.save();
+    ctx.imageSmoothingEnabled=false;
+    ctx.translate(f.ox+vw*f.s,f.oy); ctx.scale(-f.s*vw/GW,f.s*vh/GH);
+    ctx.drawImage(mosaic,0,0);
+    ctx.restore();
+    ctx.imageSmoothingEnabled=true;
+  }
+  drawParticles(f);
+  // bounding box + glitch label
+  if(bbox){
+    const colors={green:"#22e04a",red:"#ff2b2b",blue:"#8fd0ff",natural:"#ff2b2b"};
+    const c=colors[style];
+    const x=f.ox+(1-bbox.x1)*vw*f.s, y=f.oy+bbox.y0*vh*f.s;
+    const w=(bbox.x1-bbox.x0)*vw*f.s, h=(bbox.y1-bbox.y0)*vh*f.s;
+    ctx.strokeStyle=c;ctx.lineWidth=1.5*DPR;
+    ctx.strokeRect(x,y,w,h);
+    const fs=11*DPR;
+    ctx.font=`${fs}px ui-monospace,Menlo,monospace`;
+    const tw=ctx.measureText(labelText).width+10*DPR;
+    ctx.strokeRect(x,y-fs*1.7,tw,fs*1.5);
+    ctx.fillStyle=c;
+    if(Math.random()<0.06)labelText=glitchLabel(6);
+    ctx.fillText(labelText,x+5*DPR,y-fs*0.55);
+  }
+}
+
+/* ---------- hands: quadtree panel between the palms ---------- */
+const QSRC=320;
+let qImg=null;
+function sampleVideoSmall(){
+  sctx.canvas.width=QSRC; sctx.canvas.height=Math.round(QSRC*vh/vw);
+  sctx.drawImage(video,0,0,sctx.canvas.width,sctx.canvas.height);
+  qImg=sctx.getImageData(0,0,sctx.canvas.width,sctx.canvas.height);
+}
+function regionStats(x,y,w,h){ // in small-image px
+  const d=qImg.data, W=qImg.width, H=qImg.height;
+  let sr=0,sg=0,sb=0,s2=0,n=0;
+  const step=Math.max(1,Math.floor(Math.min(w,h)/6));
+  for(let yy=y;yy<y+h&&yy<H;yy+=step)for(let xx=x;xx<x+w&&xx<W;xx+=step){
+    const j=(yy*W+xx)*4;
+    sr+=d[j];sg+=d[j+1];sb+=d[j+2];
+    const l=d[j]*0.299+d[j+1]*0.587+d[j+2]*0.114;
+    s2+=l*l;n++;
+  }
+  if(!n)return{r:0,g:0,b:0,varr:0};
+  const r=sr/n,g=sg/n,b=sb/n;
+  const ml=r*0.299+g*0.587+b*0.114;
+  return{r,g,b,varr:s2/n-ml*ml};
+}
+function quadtree(x,y,w,h,depth,thresh,cb){
+  const st=regionStats(x|0,y|0,Math.max(1,w|0),Math.max(1,h|0));
+  if(depth<=0||w<3||h<3||st.varr<thresh){cb(x,y,w,h,st);return;}
+  const hw=w/2,hh=h/2;
+  quadtree(x,y,hw,hh,depth-1,thresh,cb);
+  quadtree(x+hw,y,hw,hh,depth-1,thresh,cb);
+  quadtree(x,y+hh,hw,hh,depth-1,thresh,cb);
+  quadtree(x+hw,y+hh,hw,hh,depth-1,thresh,cb);
+}
+let panel={x:0,y:0,w:0,h:0}, handsAlpha=0, pinchPrev=false, pinchHold=0, pStyleIdx=0;
+const PANEL_STYLES=["quad","mondrian","riso","rutt","mosh","contour","thermal","rgb","dots","edge","ice"];
+const stamps=[]; // frozen squares
+
+function panelScreenRect(f){ // mirrored video coords -> screen px
+  return {
+    x:f.ox+(vw-(panel.x+panel.w))*f.s,
+    y:f.oy+panel.y*f.s,
+    w:panel.w*f.s,
+    h:panel.h*f.s
+  };
+}
+function cellLoop(X,Y,Wd,Ht,cols,cb){ // video coords; one sample per cell
+  const iw=qImg.width, ih=qImg.height, D=qImg.data;
+  const rows=Math.max(2,Math.round(cols*Ht/Wd));
+  const cw=Wd/cols, ch=Ht/rows;
+  for(let cy=0;cy<rows;cy++)for(let cx=0;cx<cols;cx++){
+    const px=Math.max(0,Math.min(iw-1,((X+cx*cw+cw/2)/vw*iw)|0));
+    const py=Math.max(0,Math.min(ih-1,((Y+cy*ch+ch/2)/vh*ih)|0));
+    const j=(py*iw+px)*4;
+    const r=D[j],g=D[j+1],b=D[j+2];
+    cb(X+cx*cw,Y+cy*ch,cw,ch,r,g,b,(r*0.299+g*0.587+b*0.114)/255,cx,cy);
+  }
+}
+function drawQuadCells(X,Y,Wd,Ht){
+  const iw=qImg.width, ih=qImg.height;
+  const thresh=Math.max(30,520-level*380-beat*60);
+  const kx=vw/iw, ky=vh/ih;
+  quadtree(X/vw*iw,Y/vh*ih,Wd/vw*iw,Ht/vh*ih,8,thresh,(x,y,w,h,st)=>{
+    ctx.fillStyle=`rgb(${st.r|0},${st.g|0},${st.b|0})`;
+    ctx.fillRect(x*kx,y*ky,w*kx+0.5,h*ky+0.5);
+    if(w*kx>5){
+      ctx.strokeStyle="rgba(0,0,0,0.45)";
+      ctx.lineWidth=0.8;
+      ctx.strokeRect(x*kx,y*ky,w*kx,h*ky);
+    }
+  });
+}
+const INFERNO=(()=>{ // 64-entry thermal palette LUT
+  const stops=[[0,10,7,35],[0.35,120,28,109],[0.6,227,89,51],[0.85,249,188,60],[1,252,255,220]];
+  const lut=[];
+  for(let i=0;i<64;i++){
+    const t=i/63;
+    let a=stops[0],b=stops[stops.length-1];
+    for(let s=0;s<stops.length-1;s++)if(t>=stops[s][0]&&t<=stops[s+1][0]){a=stops[s];b=stops[s+1];break;}
+    const k=(t-a[0])/Math.max(1e-6,b[0]-a[0]);
+    lut.push([a[1]+(b[1]-a[1])*k|0,a[2]+(b[2]-a[2])*k|0,a[3]+(b[3]-a[3])*k|0]);
+  }
+  return lut;
+})();
+const ASCII_CHARS=" .:-=+*#%@";
+// portal feedback buffer + datamosh block state
+const portalBuf=document.createElement("canvas");
+portalBuf.width=480;portalBuf.height=300;
+const portalCtx=portalBuf.getContext("2d");
+const MOSH_COLS=64, MOSH_MAXR=48;
+const moshHeld=new Float32Array(MOSH_COLS*MOSH_MAXR*3);
+const moshLum=new Float32Array(MOSH_COLS*MOSH_MAXR).fill(-1);
+const moshDx=new Float32Array(MOSH_COLS*MOSH_MAXR);
+const moshDy=new Float32Array(MOSH_COLS*MOSH_MAXR);
+
+function drawPanelContent(style,X,Y,Wd,Ht,t){
+  ctx.fillStyle="#000";
+  ctx.fillRect(X,Y,Wd,Ht);
+  if(style==="quad"){
+    drawQuadCells(X,Y,Wd,Ht);
+  }else if(style==="mondrian"){
+    // quadtree quantized to a De Stijl-ish painted palette, heavy black grid
+    const MPAL=[[242,240,234],[232,224,208],[217,201,181],[201,141,117],
+                [46,58,78],[61,65,72],[184,188,192],[26,26,26],[58,158,61]];
+    const iw=qImg.width, ih=qImg.height;
+    const thresh=Math.max(30,520-level*380-beat*60);
+    const kx=vw/iw, ky=vh/ih;
+    ctx.fillStyle="#f2f0ea";ctx.fillRect(X,Y,Wd,Ht);
+    quadtree(X/vw*iw,Y/vh*ih,Wd/vw*iw,Ht/vh*ih,8,thresh,(x,y,w,h,st)=>{
+      let best=0,bd=1e9;
+      for(let i=0;i<MPAL.length;i++){
+        const p=MPAL[i];
+        const d=(st.r-p[0])*(st.r-p[0])+(st.g-p[1])*(st.g-p[1])+(st.b-p[2])*(st.b-p[2]);
+        if(d<bd){bd=d;best=i;}
+      }
+      // occasional green accent cell on otherwise grey areas
+      if(best===6&&(((x|0)*7+(y|0)*13)%97)===0)best=8;
+      const p=MPAL[best];
+      ctx.fillStyle=`rgb(${p[0]},${p[1]},${p[2]})`;
+      ctx.fillRect(x*kx,y*ky,w*kx+0.5,h*ky+0.5);
+      ctx.strokeStyle="#141414";
+      ctx.lineWidth=Math.min(2.2,Math.max(0.9,w*kx*0.045));
+      ctx.strokeRect(x*kx,y*ky,w*kx,h*ky);
+    });
+  }else if(style==="riso"){
+    // cyanotype print: blue ink on warm paper, grainy, white border
+    const m=Math.min(Wd,Ht)*0.06;
+    ctx.fillStyle="#f4f1e9";ctx.fillRect(X,Y,Wd,Ht);
+    const IX=X+m, IY=Y+m, IW=Wd-2*m, IH=Ht-2*m;
+    cellLoop(IX,IY,IW,IH,130,(x,y,w,h,r,g,b,lum)=>{
+      let ink=Math.pow(1-lum,1.25)*1.5-Math.random()*0.22;
+      if(ink<=0.06)return;
+      ctx.fillStyle=`rgba(31,79,168,${Math.min(1,ink).toFixed(2)})`;
+      ctx.fillRect(x,y,w+0.6,h+0.6);
+    });
+    ctx.fillStyle="rgba(31,79,168,0.5)";
+    for(let i=0;i<60;i++){
+      ctx.fillRect(IX+Math.random()*IW,IY+Math.random()*IH,1.2,1.2);
+    }
+  }else if(style==="rutt"){
+    // Rutt-Etra: luminance-displaced scanline wireframe
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    const rows=60, cols=150;
+    const amp=Ht*0.16*(1+level*0.8);
+    ctx.save();
+    ctx.beginPath();ctx.rect(X,Y,Wd,Ht);ctx.clip();
+    for(let pass=0;pass<2;pass++){
+      ctx.beginPath();
+      for(let ry=0;ry<rows;ry++){
+        const yy=Y+(ry+0.5)/rows*Ht;
+        for(let cx2=0;cx2<=cols;cx2++){
+          const xx=X+cx2/cols*Wd;
+          const px=Math.max(0,Math.min(iw-1,(xx/vw*iw)|0));
+          const py=Math.max(0,Math.min(ih-1,(yy/vh*ih)|0));
+          const j=(py*iw+px)*4;
+          const lum=(D[j]*0.299+D[j+1]*0.587+D[j+2]*0.114)/255;
+          const dy=-(lum-0.15)*amp;
+          if(cx2===0)ctx.moveTo(xx,yy+dy);else ctx.lineTo(xx,yy+dy);
+        }
+      }
+      if(pass===0){ctx.strokeStyle="rgba(0,255,200,0.18)";ctx.lineWidth=2.6;}
+      else{ctx.strokeStyle="rgba(185,255,240,0.85)";ctx.lineWidth=0.9;}
+      ctx.stroke();
+    }
+    ctx.restore();
+  }else if(style==="portal"){
+    // recursive feedback: the square swallows its own image
+    const bw2=portalBuf.width, bh2=portalBuf.height;
+    portalCtx.save();
+    portalCtx.globalAlpha=0.96;
+    portalCtx.translate(bw2/2,bh2/2);
+    portalCtx.rotate(0.012+beat*0.03);
+    portalCtx.scale(0.985,0.985);
+    portalCtx.drawImage(portalBuf,-bw2/2,-bh2/2);
+    portalCtx.restore();
+    portalCtx.globalAlpha=0.3;
+    portalCtx.drawImage(video,X,Y,Wd,Ht,0,0,bw2,bh2);
+    portalCtx.globalAlpha=1;
+    portalCtx.fillStyle="rgba(40,0,80,0.04)";
+    portalCtx.fillRect(0,0,bw2,bh2);
+    ctx.drawImage(portalBuf,X,Y,Wd,Ht);
+  }else if(style==="mosh"){
+    // fake datamosh: still blocks freeze and slowly melt, motion refreshes them
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    const cols=MOSH_COLS, rows=Math.min(MOSH_MAXR,Math.max(4,Math.round(cols*Ht/Wd)));
+    const cw=Wd/cols, chh=Ht/rows;
+    ctx.save();
+    ctx.beginPath();ctx.rect(X,Y,Wd,Ht);ctx.clip();
+    for(let cy2=0;cy2<rows;cy2++)for(let cx2=0;cx2<cols;cx2++){
+      const k=cy2*cols+cx2;
+      const px=Math.max(0,Math.min(iw-1,((X+cx2*cw+cw/2)/vw*iw)|0));
+      const py=Math.max(0,Math.min(ih-1,((Y+cy2*chh+chh/2)/vh*ih)|0));
+      const j=(py*iw+px)*4;
+      const lum=(D[j]*0.299+D[j+1]*0.587+D[j+2]*0.114)/255;
+      if(moshLum[k]<0||Math.abs(lum-moshLum[k])>0.13+Math.random()*0.05){
+        moshHeld[k*3]=D[j];moshHeld[k*3+1]=D[j+1];moshHeld[k*3+2]=D[j+2];
+        moshDx[k]=0;moshDy[k]=0;
+      }else{
+        moshDx[k]+=(Math.random()-0.5)*0.6;
+        moshDy[k]+=Math.random()*0.5;
+      }
+      moshLum[k]=lum;
+      ctx.fillStyle=`rgb(${moshHeld[k*3]|0},${moshHeld[k*3+1]|0},${moshHeld[k*3+2]|0})`;
+      ctx.fillRect(X+cx2*cw+moshDx[k],Y+cy2*chh+moshDy[k],cw+0.6,chh+0.6);
+    }
+    ctx.restore();
+  }else if(style==="pixelsort"){
+    // pixel sorting: bright spans melt downward, sorted by luminance
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    const rx0=Math.max(0,(X/vw*iw)|0), ry0=Math.max(0,(Y/vh*ih)|0);
+    const rx1=Math.min(iw,((X+Wd)/vw*iw)|0), ry1=Math.min(ih,((Y+Ht)/vh*ih)|0);
+    if(rx1-rx0>4&&ry1-ry0>4){
+      const stepX=Math.max(1,Math.round((rx1-rx0)/120));
+      const stepY=Math.max(1,Math.round((ry1-ry0)/90));
+      const thr=0.42-level*0.12;
+      const nCols=Math.ceil((rx1-rx0)/stepX);
+      const cwd=Wd/nCols;
+      let ci=0;
+      for(let px=rx0;px<rx1;px+=stepX,ci++){
+        const col=[];
+        for(let py=ry0;py<ry1;py+=stepY){
+          const j=(py*iw+px)*4;
+          col.push([D[j],D[j+1],D[j+2],(D[j]*0.299+D[j+1]*0.587+D[j+2]*0.114)/255]);
+        }
+        let s=-1;
+        for(let i=0;i<=col.length;i++){
+          const bright=i<col.length&&col[i][3]>thr;
+          if(bright&&s<0)s=i;
+          else if(!bright&&s>=0){
+            const span=col.slice(s,i).sort((a,b)=>b[3]-a[3]);
+            for(let q=s;q<i;q++)col[q]=span[q-s];
+            s=-1;
+          }
+        }
+        const xx=X+ci*cwd;
+        const chh2=Ht/col.length;
+        for(let i=0;i<col.length;i++){
+          ctx.fillStyle=`rgb(${col[i][0]},${col[i][1]},${col[i][2]})`;
+          ctx.fillRect(xx,Y+i*chh2,cwd+0.5,chh2+0.5);
+        }
+      }
+    }
+  }else if(style==="kaleido"){
+    // 8-way mirror kaleidoscope, rotates with the beat
+    const cx0=X+Wd/2, cy0=Y+Ht/2;
+    const seg=8, rad=Math.hypot(Wd,Ht)*0.6;
+    const rot=t*0.0004+beat*0.25;
+    ctx.save();
+    ctx.beginPath();ctx.rect(X,Y,Wd,Ht);ctx.clip();
+    for(let i=0;i<seg;i++){
+      const a0=i/seg*Math.PI*2+rot, a1=(i+1)/seg*Math.PI*2+rot;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(cx0,cy0);
+      ctx.lineTo(cx0+Math.cos(a0)*rad,cy0+Math.sin(a0)*rad);
+      ctx.lineTo(cx0+Math.cos(a1)*rad,cy0+Math.sin(a1)*rad);
+      ctx.closePath();
+      ctx.clip();
+      ctx.translate(cx0,cy0);
+      ctx.rotate(a0+(i%2?Math.PI/seg:0));
+      ctx.scale(i%2?-1:1,1);
+      ctx.drawImage(video,X,Y,Wd,Ht,-Wd/2,-Ht/2,Wd,Ht);
+      ctx.restore();
+    }
+    ctx.restore();
+  }else if(style==="contour"){
+    // topographic: luminance bands drawn as neon contour lines
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    const CPAL=["#0b1d5e","#1440c8","#00b4ff","#00ffd0","#ff4fd8","#ffffff"];
+    cellLoop(X,Y,Wd,Ht,150,(x,y,w,h,r,g,b,lum)=>{
+      const px=Math.max(0,Math.min(iw-2,((x+w/2)/vw*iw)|0));
+      const py=Math.max(0,Math.min(ih-2,((y+h/2)/vh*ih)|0));
+      const bnd=(lum*6)|0;
+      const jr=(py*iw+px+1)*4, jd=((py+1)*iw+px)*4;
+      const lr=(D[jr]*0.299+D[jr+1]*0.587+D[jr+2]*0.114)/255;
+      const ld=(D[jd]*0.299+D[jd+1]*0.587+D[jd+2]*0.114)/255;
+      if(((lr*6)|0)!==bnd||((ld*6)|0)!==bnd){
+        ctx.fillStyle=CPAL[Math.min(5,bnd)];
+        ctx.fillRect(x,y,w+0.5,h+0.5);
+      }
+    });
+  }else if(style==="lines"){
+    // slit glitch: horizontal video slices with wavy + random offsets
+    ctx.save();
+    ctx.beginPath();ctx.rect(X,Y,Wd,Ht);ctx.clip();
+    const n=36, rh=Ht/n;
+    for(let i=0;i<n;i++){
+      const off=Math.sin(i*0.55+t*0.004)*Wd*0.03
+        +(Math.random()<0.08?(Math.random()-0.5)*Wd*0.2*(0.3+beat):0);
+      ctx.drawImage(video, X, Y+i*rh, Wd, rh, X+off, Y+i*rh, Wd, rh+0.5);
+    }
+    ctx.restore();
+  }else if(style==="bw"){
+    cellLoop(X,Y,Wd,Ht,140,(x,y,w,h,r,g,b,lum,cx,cy)=>{
+      const on=lum>(BAYER[cy&3][cx&3]+0.5)/16*0.9+0.05;
+      ctx.fillStyle=on?"#f2f2f2":"#050505";
+      ctx.fillRect(x,y,w+0.5,h+0.5);
+    });
+  }else if(style==="thermal"){
+    cellLoop(X,Y,Wd,Ht,120,(x,y,w,h,r,g,b,lum)=>{
+      const c=INFERNO[Math.min(63,(lum*63)|0)];
+      ctx.fillStyle=`rgb(${c[0]},${c[1]},${c[2]})`;
+      ctx.fillRect(x,y,w+0.5,h+0.5);
+    });
+  }else if(style==="rgb"){
+    // chromatic split: r/b channels sampled at shifted x
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    const sh=(2+beat*6)|0;
+    cellLoop(X,Y,Wd,Ht,130,(x,y,w,h,r,g,b,lum)=>{
+      const px=Math.max(0,Math.min(iw-1,((x+w/2)/vw*iw)|0));
+      const py=Math.max(0,Math.min(ih-1,((y+h/2)/vh*ih)|0));
+      const jr=(py*iw+Math.max(0,px-sh))*4;
+      const jb=(py*iw+Math.min(iw-1,px+sh))*4;
+      ctx.fillStyle=`rgb(${D[jr]},${g},${D[jb+2]})`;
+      ctx.fillRect(x,y,w+0.5,h+0.5);
+    });
+  }else if(style==="ascii"){
+    ctx.fillStyle="#020502";ctx.fillRect(X,Y,Wd,Ht);
+    const cols=46, rows=Math.max(2,Math.round(cols*Ht/Wd*0.55));
+    const cw=Wd/cols, chh=Ht/rows;
+    ctx.font=`${chh*0.95}px ui-monospace,Menlo,monospace`;
+    ctx.textBaseline="top";
+    ctx.fillStyle="#35e065";
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    for(let cy=0;cy<rows;cy++)for(let cx=0;cx<cols;cx++){
+      const px=Math.max(0,Math.min(iw-1,((X+cx*cw+cw/2)/vw*iw)|0));
+      const py=Math.max(0,Math.min(ih-1,((Y+cy*chh+chh/2)/vh*ih)|0));
+      const j=(py*iw+px)*4;
+      const lum=(D[j]*0.299+D[j+1]*0.587+D[j+2]*0.114)/255;
+      const ch=ASCII_CHARS[Math.min(ASCII_CHARS.length-1,(lum*ASCII_CHARS.length)|0)];
+      if(ch!==" ")ctx.fillText(ch,X+cx*cw,Y+cy*chh);
+    }
+  }else if(style==="dots"){
+    // halftone print
+    ctx.fillStyle="#0a0a0a";ctx.fillRect(X,Y,Wd,Ht);
+    ctx.fillStyle="#f2efe8";
+    cellLoop(X,Y,Wd,Ht,72,(x,y,w,h,r,g,b,lum)=>{
+      const rad=lum*w*0.62;
+      if(rad<0.4)return;
+      ctx.beginPath();ctx.arc(x+w/2,y+h/2,rad,0,7);ctx.fill();
+    });
+  }else if(style==="ice"){
+    cellLoop(X,Y,Wd,Ht,120,(x,y,w,h,r,g,b,lum)=>{
+      const iv=1-lum*0.55;
+      ctx.fillStyle=`rgb(${110*iv|0},${170*iv+40|0},${255*Math.min(1,iv+0.25)|0})`;
+      ctx.fillRect(x,y,w+0.5,h+0.5);
+    });
+  }else if(style==="green"){
+    cellLoop(X,Y,Wd,Ht,80,(x,y,w,h,r,g,b,lum,cx,cy)=>{
+      let l=Math.pow(lum,0.8);
+      if((cx+cy)%2===1&&l<0.75)l*=0.25;
+      ctx.fillStyle=`rgb(${20*l|0},${90+165*l|0},${40*l|0})`;
+      ctx.fillRect(x,y,w+0.5,h+0.5);
+    });
+  }else{ // edge: neon contour lines
+    const iw=qImg.width, ih=qImg.height, D=qImg.data;
+    cellLoop(X,Y,Wd,Ht,150,(x,y,w,h,r,g,b,lum)=>{
+      const px=Math.max(0,Math.min(iw-2,((x+w/2)/vw*iw)|0));
+      const py=Math.max(0,Math.min(ih-2,((y+h/2)/vh*ih)|0));
+      const j=(py*iw+px)*4, jr=j+4, jd=j+iw*4;
+      const l=(D[j]*0.299+D[j+1]*0.587+D[j+2]*0.114);
+      const lr=(D[jr]*0.299+D[jr+1]*0.587+D[jr+2]*0.114);
+      const ld=(D[jd]*0.299+D[jd+1]*0.587+D[jd+2]*0.114);
+      const m=Math.min(1,(Math.abs(l-lr)+Math.abs(l-ld))/255*4);
+      if(m>0.12){
+        ctx.fillStyle=`rgba(160,255,240,${m.toFixed(2)})`;
+        ctx.fillRect(x,y,w+0.5,h+0.5);
+      }
+    });
+  }
+}
+
+function renderHands(t){
+  const f=fitRect();
+  // stage: raw mirrored video
+  ctx.save();
+  ctx.globalAlpha=0.85;
+  ctx.translate(f.ox+vw*f.s,f.oy);ctx.scale(-f.s,f.s);
+  ctx.drawImage(video,0,0,vw,vh);
+  ctx.restore();
+  ctx.globalAlpha=1;
+  // frozen squares stay exactly as captured
+  for(const s of stamps){
+    ctx.drawImage(s.img,s.nx*CW,s.ny*CH,s.nw*CW,s.nh*CH);
+    ctx.strokeStyle="rgba(255,255,255,0.8)";
+    ctx.lineWidth=1.2*DPR;
+    ctx.strokeRect(s.nx*CW,s.ny*CH,s.nw*CW,s.nh*CH);
+  }
+  if(!hands)return;
+  const res=hands.detectForVideo(video,t);
+  const lms=res.landmarks||[];
+  const palms=lms.map(lm=>({x:(lm[0].x+lm[9].x)/2, y:(lm[0].y+lm[9].y)/2}));
+  // pinch: thumb-index gap relative to palm width, hysteresis + 2-frame debounce
+  let ratio=1e9;
+  for(const lm of lms){
+    const palm=Math.hypot(lm[5].x-lm[17].x,lm[5].y-lm[17].y)+1e-6;
+    const d=Math.hypot(lm[4].x-lm[8].x,lm[4].y-lm[8].y)/palm;
+    if(d<ratio)ratio=d;
+  }
+  pinchHold=ratio<0.38?pinchHold+1:0;
+  const pinching=pinchPrev?ratio<0.62:pinchHold>=2;
+
+  // live square: strictly axis-aligned; the palms set the edge lengths
+  let tAlpha=0;
+  if(palms.length>=2){
+    const x0=Math.min(palms[0].x,palms[1].x)*vw, x1=Math.max(palms[0].x,palms[1].x)*vw;
+    const y0=Math.min(palms[0].y,palms[1].y)*vh, y1=Math.max(palms[0].y,palms[1].y)*vh;
+    const w=Math.max(50,x1-x0), h=Math.max(40,y1-y0);
+    panel.x+=((x0+x1)/2-w/2-panel.x)*0.3;
+    panel.y+=((y0+y1)/2-h/2-panel.y)*0.3;
+    panel.w+=(w-panel.w)*0.3;
+    panel.h+=(h-panel.h)*0.3;
+    tAlpha=1;
+  }else if(palms.length===1){
+    panel.x+=(palms[0].x*vw-panel.w/2-panel.x)*0.3;
+    panel.y+=(palms[0].y*vh-panel.h/2-panel.y)*0.3;
+    panel.w+=(vw*0.26-panel.w)*0.1;
+    panel.h+=(vw*0.20-panel.h)*0.1;
+    tAlpha=1;
+  }
+  handsAlpha+=(tAlpha-handsAlpha)*(tAlpha?0.3:0.08);
+
+  if(handsAlpha>=0.04){
+    sampleVideoSmall();
+    ctx.save();
+    ctx.translate(f.ox+vw*f.s,f.oy);ctx.scale(-f.s,f.s);
+    ctx.globalAlpha=handsAlpha;
+    drawPanelContent(PANEL_STYLES[pStyleIdx],panel.x,panel.y,panel.w,panel.h,t);
+    ctx.restore();
+    ctx.globalAlpha=1;
+    const sr=panelScreenRect(f);
+    ctx.strokeStyle="rgba(255,255,255,0.95)";
+    ctx.lineWidth=1.6*DPR;
+    ctx.strokeRect(sr.x,sr.y,sr.w,sr.h);
+    ctx.font=`${10*DPR}px ui-monospace,Menlo,monospace`;
+    ctx.fillStyle="rgba(255,255,255,0.85)";
+    ctx.fillText(PANEL_STYLES[pStyleIdx].toUpperCase(),sr.x,sr.y-5*DPR);
+  }else{
+    statsEl.textContent="Show your hands to the camera";
+  }
+
+  // pinch rising edge: freeze the square as rendered, hand gets the next effect
+  if(pinching&&!pinchPrev&&handsAlpha>0.5){
+    const sr=panelScreenRect(f);
+    if(sr.w>8&&sr.h>8){
+      const img=document.createElement("canvas");
+      img.width=Math.round(sr.w); img.height=Math.round(sr.h);
+      img.getContext("2d").drawImage(out,sr.x,sr.y,sr.w,sr.h,0,0,img.width,img.height);
+      stamps.push({img,nx:sr.x/CW,ny:sr.y/CH,nw:sr.w/CW,nh:sr.h/CH});
+      if(stamps.length>14)stamps.shift();
+      pStyleIdx=(pStyleIdx+1)%PANEL_STYLES.length;
+    }
+  }
+  pinchPrev=pinching;
+
+  // fingertip pixels (scattered white squares, like the reference)
+  ctx.save();
+  ctx.translate(f.ox+vw*f.s,f.oy);ctx.scale(-f.s,f.s);
+  ctx.fillStyle="rgba(255,255,255,0.92)";
+  for(const lm of lms){
+    for(const ti of [4,8,12,16,20]){
+      const x=lm[ti].x*vw, y=lm[ti].y*vh;
+      const s2=4+Math.random()*3;
+      ctx.fillRect(x-s2/2,y-s2/2,s2,s2);
+      if(Math.random()<0.3)
+        ctx.fillRect(x+(Math.random()-0.5)*44,y+(Math.random()-0.5)*44,3,3);
+    }
+  }
+  ctx.restore();
+}
+
+/* ---------- main loop ---------- */
+let frames=0,lastFps=performance.now(),segBusy=false;
+function frame(now){
+  requestAnimationFrame(frame);
+  if(!camOn||video.readyState<2)return;
+  updateAudio(now/1000);
+  updateEQ(now);
+  if(mode!==2&&segmenter){
+    try{ runSegmentation(now); spawnParticles(); }catch(e){}
+  }
+  ctx.fillStyle="#000";
+  ctx.fillRect(0,0,CW,CH);
+  if(mode===0)renderCutout();
+  else if(mode===1)renderDetect(now);
+  else renderHands(now);
+  applyPost();
+  if(recorder)rctx.drawImage(out,0,0,recCanvas.width,recCanvas.height);
+  frames++;
+  if(now-lastFps>1000){
+    statsEl.textContent=`${frames} FPS`;
+    frames=0;lastFps=now;
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
