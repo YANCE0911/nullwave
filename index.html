@@ -500,7 +500,7 @@ function quadtree(x,y,w,h,depth,thresh,cb){
   quadtree(x+hw,y+hh,hw,hh,depth-1,thresh,cb);
 }
 let panel={x:0,y:0,w:0,h:0}, handsAlpha=0, pinchPrev=false, pinchHold=0, pStyleIdx=0;
-const PANEL_STYLES=["quad","mondrian","riso","rutt","mosh","contour","thermal","rgb","dots","edge","ice"];
+const PANEL_STYLES=["quad","cube","mondrian","riso","rutt","mosh","contour","thermal","rgb","dots","edge","ice"];
 const stamps=[]; // frozen squares
 
 function panelScreenRect(f){ // mirrored video coords -> screen px
@@ -560,7 +560,54 @@ const moshLum=new Float32Array(MOSH_COLS*MOSH_MAXR).fill(-1);
 const moshDx=new Float32Array(MOSH_COLS*MOSH_MAXR);
 const moshDy=new Float32Array(MOSH_COLS*MOSH_MAXR);
 
+/* floating point-cloud cube: white wire cage + ice-blue particle mist */
+const cubeParts=[];
+function drawCube(X,Y,Wd,Ht,t){
+  const cx=X+Wd/2, cy=Y+Ht/2;
+  const s=Math.min(Wd,Ht)*0.42;
+  const ry=t*0.00045, rx=0.35+Math.sin(t*0.0002)*0.15;
+  const cy1=Math.cos(ry),sy1=Math.sin(ry),cx1=Math.cos(rx),sx1=Math.sin(rx);
+  const proj=(px,py,pz)=>{
+    const x=px*cy1+pz*sy1, z=-px*sy1+pz*cy1;
+    const y2=py*cx1-z*sx1, z2=py*sx1+z*cx1;
+    const k=2.6/(z2+3.4);
+    return [cx+x*k*s, cy+y2*k*s, k];
+  };
+  if(!cubeParts.length){
+    const g=()=>(Math.random()+Math.random()+Math.random())/1.5-1;
+    for(let i=0;i<2600;i++)cubeParts.push({x:g(),y:g(),z:g(),s:Math.random()*6.28});
+  }
+  ctx.save();
+  ctx.globalCompositeOperation="lighter";
+  const spd=0.010+level*0.02+beat*0.02;
+  for(const p of cubeParts){
+    p.x+=spd*Math.sin(p.y*2.3+t*0.0007+p.s);
+    p.y+=spd*Math.sin(p.z*1.9+t*0.0009+p.s*2.0);
+    p.z+=spd*Math.sin(p.x*2.1+t*0.0008+p.s*3.0);
+    if(Math.abs(p.x)>1||Math.abs(p.y)>1||Math.abs(p.z)>1){
+      const g=()=>(Math.random()+Math.random()+Math.random())/1.5-1;
+      p.x=g()*0.5;p.y=g()*0.5;p.z=g()*0.5;
+    }
+    const pr=proj(p.x,p.y,p.z);
+    ctx.fillStyle=`rgba(150,215,255,${(0.10+0.25*pr[2]).toFixed(2)})`;
+    const sz=1.1*pr[2]*(1+level);
+    ctx.fillRect(pr[0],pr[1],sz+0.6,sz+0.6);
+  }
+  ctx.restore();
+  const C=[];
+  for(let i=0;i<8;i++)C.push(proj(i&1?1:-1, i&2?1:-1, i&4?1:-1));
+  const E=[[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+  ctx.strokeStyle="rgba(255,255,255,0.9)";
+  ctx.lineWidth=1.4;
+  ctx.beginPath();
+  for(const[a2,b2]of E){ctx.moveTo(C[a2][0],C[a2][1]);ctx.lineTo(C[b2][0],C[b2][1]);}
+  ctx.stroke();
+  ctx.fillStyle="#fff";
+  for(const c of C){ctx.beginPath();ctx.arc(c[0],c[1],3.2,0,7);ctx.fill();}
+}
+
 function drawPanelContent(style,X,Y,Wd,Ht,t){
+  if(style==="cube"){ drawCube(X,Y,Wd,Ht,t); return; } // video stays visible behind
   ctx.fillStyle="#000";
   ctx.fillRect(X,Y,Wd,Ht);
   if(style==="quad"){
@@ -895,13 +942,15 @@ function renderHands(t){
     drawPanelContent(PANEL_STYLES[pStyleIdx],panel.x,panel.y,panel.w,panel.h,t);
     ctx.restore();
     ctx.globalAlpha=1;
-    const sr=panelScreenRect(f);
-    ctx.strokeStyle="rgba(255,255,255,0.95)";
-    ctx.lineWidth=1.6*DPR;
-    ctx.strokeRect(sr.x,sr.y,sr.w,sr.h);
-    ctx.font=`${10*DPR}px ui-monospace,Menlo,monospace`;
-    ctx.fillStyle="rgba(255,255,255,0.85)";
-    ctx.fillText(PANEL_STYLES[pStyleIdx].toUpperCase(),sr.x,sr.y-5*DPR);
+    if(PANEL_STYLES[pStyleIdx]!=="cube"){ // cube brings its own 3D frame
+      const sr=panelScreenRect(f);
+      ctx.strokeStyle="rgba(255,255,255,0.95)";
+      ctx.lineWidth=1.6*DPR;
+      ctx.strokeRect(sr.x,sr.y,sr.w,sr.h);
+      ctx.font=`${10*DPR}px ui-monospace,Menlo,monospace`;
+      ctx.fillStyle="rgba(255,255,255,0.85)";
+      ctx.fillText(PANEL_STYLES[pStyleIdx].toUpperCase(),sr.x,sr.y-5*DPR);
+    }
   }else{
     statsEl.textContent="Show your hands to the camera";
   }
